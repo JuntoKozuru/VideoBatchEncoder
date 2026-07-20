@@ -338,11 +338,39 @@ int       total = candidateFiles.Count;
 
 log.WriteSessionHeader(cfg, gpuName, processMode, now, isResumed);
 
+// ============================================================
+//  動画の長さを事前スキャン（時間ベースの進捗表示に使う合計時間を算出）
+//  ffmpeg -i はヘッダ情報だけを読むため、ファイル数が多くても比較的高速。
+//  ここで得た結果は fr.InMeta にそのまま保持し、後段のループでの
+//  二重Probeを避ける。
+// ============================================================
+double totalDurationSeconds = 0;
+{
+    var pendingForScan = session.Files.Where(f => f.Result == EncodeResult.Pending).ToList();
+    for (int si = 0; si < pendingForScan.Count; si++)
+    {
+        var sfr = pendingForScan[si];
+        if (!sfr.InMeta.Valid)
+            sfr.InMeta = MediaInfoReader.Probe(cfg.FfmpegPath, sfr.InPath);
+
+        if (sfr.InMeta.Valid && sfr.InMeta.Duration > 0)
+            totalDurationSeconds += sfr.InMeta.Duration;
+
+        // \x1b[2K で行全体を消してから書くため、前の文字列より短くても
+        // 文字が残留することがない。
+        Console.Write($"\x1b[2K\r  動画の長さを解析しています... ({si + 1}/{pendingForScan.Count})");
+    }
+    if (pendingForScan.Count > 0)
+    {
+        Console.Write("\x1b[2K\r  動画の長さの解析が完了しました。\n");
+    }
+}
+
 var reWarnLine  = new Regex(@"(?i)(error|invalid|failed|corrupt|missing|broken|no such)");
 var reFrameNum  = new Regex(@"frame=\s*(\d+)");
 var reTimeStamp = new Regex(@"time=(\d+:\d+:\d+\.\d+)");
 
-var progressBar = new BatchProgressBar(total, cfg.InteractiveUI);
+var progressBar = new BatchProgressBar(total, cfg.InteractiveUI, totalDurationSeconds);
 progressBar.Initialize();
 
 // レジューム時は既に処理済み（Pending以外）のファイルをスキップする
@@ -368,14 +396,13 @@ for (int i = startIndex; i < total; i++)
 
     Directory.CreateDirectory(outDir);
 
-    Console.WriteLine();
-    Console.ForegroundColor = ConsoleColor.Cyan;
-    Console.WriteLine($"[{i+1}/{total}] 解析中: {Path.GetFileName(inPath)}");
-    Console.ResetColor();
+    // 「解析中」等の個別メッセージはコンソールに出さない（固定2行レイアウトを保つため）。
+    // 進捗は progressBar の現在ファイル行で示される。
 
-    // ── Probeの遅延実行: ここで初めてFFmpegによるメタデータ解析を行う ──
-    var inMeta = MediaInfoReader.Probe(cfg.FfmpegPath, inPath);
-    fr.InMeta  = inMeta;
+    // ── Probe結果の再利用: 事前スキャンで既に取得済みならそれを使う ──
+    if (!fr.InMeta.Valid)
+        fr.InMeta = MediaInfoReader.Probe(cfg.FfmpegPath, inPath);
+    var inMeta = fr.InMeta;
     var fileStartTime = DateTime.Now;
 
     // ── SKIP: 認識不可 ────────────────────────────────
@@ -386,10 +413,8 @@ for (int i = startIndex; i < total; i++)
         fr.ErrFrame = "不明";
         sessionStore.Save(session);
 
-        Console.ForegroundColor = ConsoleColor.Yellow;
-        Console.WriteLine("  -> SKIP（認識不可）");
-        Console.ResetColor();
-        progressBar.Update(i + 1, DateTime.Now - fileStartTime);
+        progressBar.ReportNonPass("SKIP", fr.FileName, "認識不可");
+        progressBar.Update(i + 1, DateTime.Now - fileStartTime, fileDurationSeconds: 0);
         continue;
     }
 
@@ -401,22 +426,35 @@ for (int i = startIndex; i < total; i++)
         fr.ErrFrame = "不明";
         sessionStore.Save(session);
 
-        Console.ForegroundColor = ConsoleColor.Yellow;
-        Console.WriteLine("  -> SKIP（既存ファイル）");
-        Console.ResetColor();
-        progressBar.Update(i + 1, DateTime.Now - fileStartTime);
+        progressBar.ReportNonPass("SKIP", fr.FileName, "既存ファイル");
+        progressBar.Update(i + 1, DateTime.Now - fileStartTime,
+            fileDurationSeconds: inMeta.Duration > 0 ? inMeta.Duration : 0);
         continue;
     }
 
     // ── エンコード（リトライループ） ──────────────────
     var (encResult, usedFallback) = RunEncodeWithRetry(
-        cfg, inPath, tmpPath, Path.GetFileName(inPath), i + 1, total, fr);
+        cfg, inPath, tmpPath, Path.GetFileName(inPath), i + 1, total, fr, progressBar);
 
     FinalizeEncodeResult(cfg, fr, inMeta, encResult, outPath, tmpPath, overwriteMode, logMode,
                          reWarnLine, reFrameNum, reTimeStamp);
 
+    // PASS時は何も表示せず、WARN/FAILのみ固定2行の下に追記する。
+    if (fr.Result == EncodeResult.Warn)
+    {
+        var detail = fr.DurationWarn != null
+            ? $"Duration差 {fr.DurationWarn}"
+            : (fr.WarnInfo?.WarnLines.Count > 0 ? fr.WarnInfo.WarnLines[0].Trim() : "詳細はログを参照");
+        progressBar.ReportNonPass("WARN", fr.FileName, detail);
+    }
+    else if (fr.Result == EncodeResult.Fail)
+    {
+        progressBar.ReportNonPass("FAIL", fr.FileName, $"ExitCode: {fr.ExitCode}");
+    }
+
     sessionStore.Save(session);
-    progressBar.Update(i + 1, encResult.Elapsed, usedFallback);
+    progressBar.Update(i + 1, encResult.Elapsed, usedFallback,
+        fileDurationSeconds: inMeta.Duration > 0 ? inMeta.Duration : 0);
 }
 
 progressBar.Complete();
@@ -450,10 +488,7 @@ if (cfg.SecondPassEnabled)
             var fr = warnFiles[wi];
             fr.OriginalResult = fr.Result;
 
-            Console.WriteLine();
-            Console.ForegroundColor = ConsoleColor.Cyan;
-            Console.WriteLine($"[第2パス {wi+1}/{warnFiles.Count}] 再チャレンジ: {fr.FileName}");
-            Console.ResetColor();
+            // 「再チャレンジ」等の個別メッセージはコンソールに出さない（固定2行レイアウトを保つため）。
 
             var outDir  = Path.GetDirectoryName(fr.OutPath)!;
             var tmpPath = Path.Combine(outDir, Path.GetFileNameWithoutExtension(fr.OutPath) + ".mp4.tmp");
@@ -467,7 +502,8 @@ if (cfg.SecondPassEnabled)
                 var cmd    = $"{cfg.FfmpegPath} {argStr}";
 
                 var enc = FfmpegEncoder.Run(cfg.FfmpegPath, argStr, fr.FileName, wi + 1, warnFiles.Count,
-                                            retryIndex: attempt, interactiveUI: cfg.InteractiveUI);
+                                            retryIndex: attempt, interactiveUI: cfg.InteractiveUI,
+                                            progressBar: secondPassBar);
 
                 var warnInfo = StderrParser.ParseFile(enc.StderrLogPath);
                 TryDeleteFile(enc.StderrLogPath);
@@ -492,9 +528,7 @@ if (cfg.SecondPassEnabled)
                         fr.SecondPassLog.Add($"{attempt}回目で問題が解消されPASSへ回復");
                         recovered = true;
                         sessionStore.Save(session);
-                        Console.ForegroundColor = ConsoleColor.Green;
-                        Console.WriteLine($"  -> 回復: PASS（{attempt}回目）");
-                        Console.ResetColor();
+                        secondPassBar.ReportNonPass("PASS", fr.FileName, $"第2パス{attempt}回目で回復");
                         break;
                     }
                     else
@@ -511,9 +545,8 @@ if (cfg.SecondPassEnabled)
 
             if (!recovered)
             {
-                Console.ForegroundColor = ConsoleColor.Yellow;
-                Console.WriteLine($"  -> {cfg.SecondPassMaxRetry}回再チャレンジしても解消せず、WARNのまま維持します");
-                Console.ResetColor();
+                secondPassBar.ReportNonPass("WARN", fr.FileName,
+                    $"{cfg.SecondPassMaxRetry}回再チャレンジしても解消せず");
             }
 
             sessionStore.Save(session);
@@ -567,7 +600,7 @@ return 0;
 
 static (EncodeOutput Output, bool UsedFallback) RunEncodeWithRetry(
     AppConfig cfg, string inPath, string tmpPath, string label,
-    int fileIndex, int fileTotal, FileResult fr)
+    int fileIndex, int fileTotal, FileResult fr, BatchProgressBar? progressBar = null)
 {
     EncodeOutput? enc         = null;
     int           attemptsMax = cfg.RetryMax + 1;
@@ -591,14 +624,13 @@ static (EncodeOutput Output, bool UsedFallback) RunEncodeWithRetry(
         var cmdLine = $"{cfg.FfmpegPath} {argStr}";
         fr.Command = cmdLine;
 
-        Console.ForegroundColor = ConsoleColor.Green;
-        Console.WriteLine(attempt == 0
-            ? $"  エンコード開始: {label}"
-            : $"  リトライ {attempt}/{cfg.RetryMax} 実行: {label}");
-        Console.ResetColor();
+        // 「エンコード開始」「リトライ実行」等の個別メッセージはコンソールに出さない。
+        // 固定2行レイアウト（案B）ではPASS時に何も表示せず、進捗バー2行のみを保つ方針のため。
+        // 詳細はログファイル（RetryLog）に記録される。
 
         enc = FfmpegEncoder.Run(cfg.FfmpegPath, argStr, label, fileIndex, fileTotal,
-                                retryIndex: attempt, interactiveUI: cfg.InteractiveUI);
+                                retryIndex: attempt, interactiveUI: cfg.InteractiveUI,
+                                progressBar: progressBar);
 
         if (enc.ExitCode == 0 && File.Exists(tmpPath))
         {
@@ -618,9 +650,6 @@ static (EncodeOutput Output, bool UsedFallback) RunEncodeWithRetry(
         if (attempt < attemptsMax - 1)
         {
             fr.RetryLog.Add($"試行{attempt + 1}回目失敗（ExitCode={enc.ExitCode}） → {cfg.RetryDelay}秒後にリトライ");
-            Console.ForegroundColor = ConsoleColor.DarkYellow;
-            Console.WriteLine($"  -> 失敗（ExitCode: {enc.ExitCode}）。{cfg.RetryDelay}秒後にリトライします...");
-            Console.ResetColor();
             if (cfg.RetryDelay > 0) Thread.Sleep(cfg.RetryDelay * 1000);
         }
         else
@@ -706,18 +735,9 @@ static void FinalizeEncodeResult(
         if (logMode != "2") outMeta = null;
 
         var resultLabel = warnInfo.HasWarn ? EncodeResult.Warn : EncodeResult.Pass;
-        var color       = resultLabel == EncodeResult.Warn ? ConsoleColor.Yellow : ConsoleColor.Green;
-        Console.ForegroundColor = color;
-        Console.WriteLine($"  -> {(resultLabel == EncodeResult.Pass ? "PASS" : "WARN")}  " +
-                          $"(ExitCode: {enc.ExitCode} | 処理時間: {LogWriter.FormatElapsed(enc.Elapsed)}" +
-                          (fr.RetryCount > 0 ? $" | リトライ{fr.RetryCount}回" : "") + ")");
-        Console.ResetColor();
-        if (durWarn != null)
-        {
-            Console.ForegroundColor = ConsoleColor.Yellow;
-            Console.WriteLine($"     ※ Duration差警告: {durWarn}");
-            Console.ResetColor();
-        }
+
+        // PASS/WARNのコンソール表示は呼び出し元(メインループ)が progressBar.ReportNonPass を
+        // 介して行う（固定2行レイアウトを保つため、ここでは直接コンソールに書かない）。
 
         fr.Result       = resultLabel;
         fr.Elapsed       = enc.Elapsed;
@@ -733,10 +753,7 @@ static void FinalizeEncodeResult(
     {
         try { if (File.Exists(tmpPath)) File.Delete(tmpPath); } catch { }
 
-        Console.ForegroundColor = ConsoleColor.Red;
-        Console.WriteLine($"  -> FAIL  (ExitCode: {enc.ExitCode} | 処理時間: {LogWriter.FormatElapsed(enc.Elapsed)}" +
-                          (cfg.RetryMax > 0 ? $" | {cfg.RetryMax}回リトライ後も失敗" : "") + ")");
-        Console.ResetColor();
+        // FAILのコンソール表示も呼び出し元が progressBar.ReportNonPass を介して行う。
 
         fr.Result   = EncodeResult.Fail;
         fr.Elapsed  = enc.Elapsed;
@@ -751,6 +768,7 @@ static void TryDeleteFile(string path)
 {
     try { if (!string.IsNullOrEmpty(path) && File.Exists(path)) File.Delete(path); } catch { }
 }
+
 
 static string ReadChoice(string prompt, string[] valid)
 {
@@ -775,7 +793,7 @@ static string GetGpuName()
             FileName               = "nvidia-smi",
             Arguments              = "--query-gpu=name --format=csv,noheader",
             UseShellExecute        = false,
-            CreateNoWindow         = true,
+            CreateNoWindow          = true,
             RedirectStandardOutput = true,
             RedirectStandardError  = true,
         };

@@ -27,6 +27,9 @@ internal static partial class FfmpegEncoder
     [GeneratedRegex(@"^(fps=|stream_|bitrate=|total_size=|out_time|dup_frames|drop_frames|speed=|progress=)")]
     private static partial Regex ReProgressExtra();
 
+    [GeneratedRegex(@"^out_time=(\d+):(\d{2}):(\d{2})\.(\d+)")]
+    private static partial Regex ReOutTime();
+
     // ────────────────────────────────────────────────────────
     //  引数ビルド（コーデックファミリーに応じてオプションを切替）
     // ────────────────────────────────────────────────────────
@@ -113,13 +116,14 @@ internal static partial class FfmpegEncoder
     //  エンコード実行
     // ────────────────────────────────────────────────────────
     public static EncodeOutput Run(
-        string ffmpegPath,
-        string arguments,
-        string label,
-        int    fileIndex,
-        int    fileTotal,
-        int    retryIndex    = 0,      // 0=初回, 1以上=リトライ回数
-        bool   interactiveUI = true)   // false: カーソル制御なし・改行のみで進捗表示
+        string             ffmpegPath,
+        string             arguments,
+        string             label,
+        int                fileIndex,
+        int                fileTotal,
+        int                retryIndex    = 0,      // 0=初回, 1以上=リトライ回数
+        bool               interactiveUI = true,   // false: カーソル制御なし・改行のみで進捗表示
+        BatchProgressBar?  progressBar   = null)   // 渡された場合、進捗行をこのバーの固定座席に書く
     {
         var psi = new ProcessStartInfo
         {
@@ -150,6 +154,13 @@ internal static partial class FfmpegEncoder
         int progressLineCounter = 0;
         const int NonInteractiveThrottle = 30; // 約30回のframe=行ごとに1回出力
 
+        // 対話モード（固定行への上書き）も、ffmpegのframe=行が高頻度（1秒間に
+        // 数十回）で来るため、時間ベースで再描画頻度を間引く。
+        // 間引かないと、バックグラウンドタイマー（スピナー）との書き込み競合が
+        // 増え、チラつきや表示崩れの原因になる。
+        var interactiveThrottle = Stopwatch.StartNew();
+        const int InteractiveMinIntervalMs = 120; // これ未満の間隔では再描画しない
+
         using (var stderrWriter = new StreamWriter(stderrLogPath, append: false, System.Text.Encoding.UTF8))
         {
             while (true)
@@ -164,12 +175,30 @@ internal static partial class FfmpegEncoder
                 {
                     if (interactiveUI)
                     {
-                        // 同一行上書き表示
-                        var display = $"[{fileIndex.ToString().PadLeft(indexWidth)}/{fileTotal}]{retryTag} {label}  |  {stripped}";
-                        int maxLen  = Math.Max(1, Console.WindowWidth - 1);
-                        if (display.Length > maxLen) display = display[..maxLen];
-                        else display = display.PadRight(maxLen);
-                        Console.Write($"\r{display}");
+                        // 時間ベースの間引き: 前回描画から InteractiveMinIntervalMs 未満なら
+                        // このframe=行では再描画しない（ffmpegの出力頻度そのものを
+                        // 落とすわけではなく、あくまで画面への書き込み回数だけを間引く）。
+                        if (interactiveThrottle.ElapsedMilliseconds >= InteractiveMinIntervalMs)
+                        {
+                            interactiveThrottle.Restart();
+
+                            var display = $"[{fileIndex.ToString().PadLeft(indexWidth)}/{fileTotal}]{retryTag} {label}  |  {stripped}";
+
+                            if (progressBar != null)
+                            {
+                                // BatchProgressBar の固定座席（2行目）に書く。
+                                // 改行・スクロールは一切発生しない。
+                                progressBar.UpdateCurrentFileLine(display);
+                            }
+                            else
+                            {
+                                // 後方互換: progressBar未指定時は従来の \r 同一行上書き
+                                int maxLen = Math.Max(1, Console.WindowWidth - 1);
+                                if (display.Length > maxLen) display = display[..maxLen];
+                                else display = display.PadRight(maxLen);
+                                Console.Write($"\r{display}");
+                            }
+                        }
                     }
                     else
                     {
@@ -177,6 +206,26 @@ internal static partial class FfmpegEncoder
                         progressLineCounter++;
                         if (progressLineCounter % NonInteractiveThrottle == 0)
                             Console.WriteLine($"[{fileIndex.ToString().PadLeft(indexWidth)}/{fileTotal}]{retryTag} {label}  |  {stripped}");
+                    }
+                }
+                else if (stripped.StartsWith("out_time=", StringComparison.Ordinal))
+                {
+                    // 現在ファイルの処理済み時間（バッチ全体を動画の長さで
+                    // 重み付けした進捗率の計算に使う）。表示への反映は
+                    // BatchProgressBar側のタイマーが約120ms間隔でまとめて行うため、
+                    // ここでは値の保持のみ（毎回即時描画はしない＝チラつき防止）。
+                    if (interactiveUI && progressBar != null)
+                    {
+                        var m = ReOutTime().Match(stripped);
+                        if (m.Success)
+                        {
+                            var outTime = new TimeSpan(
+                                0,
+                                int.Parse(m.Groups[1].Value),
+                                int.Parse(m.Groups[2].Value),
+                                int.Parse(m.Groups[3].Value));
+                            progressBar.UpdateCurrentOutTime(outTime);
+                        }
                     }
                 }
                 else if (ReProgressExtra().IsMatch(stripped))
@@ -194,7 +243,9 @@ internal static partial class FfmpegEncoder
         stdoutTask.Wait();
         sw.Stop();
 
-        if (interactiveUI) Console.WriteLine(); // 進捗行の末尾改行
+        // progressBar使用時は固定座席をそのまま使うため改行不要。
+        // 未指定（後方互換の\r方式）の場合のみ、進捗行の末尾改行を行う。
+        if (interactiveUI && progressBar is null) Console.WriteLine();
 
         return new EncodeOutput
         {
